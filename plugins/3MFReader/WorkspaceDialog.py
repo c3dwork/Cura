@@ -33,7 +33,6 @@ class WorkspaceDialog(QObject):
         self.showDialogSignal.connect(self.__show)
 
         self._has_quality_changes_conflict = False
-        self._has_definition_changes_conflict = False
         self._has_machine_conflict = False
         self._has_material_conflict = False
         self._has_visible_settings_field = False
@@ -47,12 +46,10 @@ class WorkspaceDialog(QObject):
         self._machine_type = ""
         self._variant_type = ""
         self._material_labels = []
-        self._extruders = []
         self._objects_on_plate = False
 
     machineConflictChanged = pyqtSignal()
     qualityChangesConflictChanged = pyqtSignal()
-    definitionChangesConflictChanged = pyqtSignal()
     materialConflictChanged = pyqtSignal()
     numVisibleSettingsChanged = pyqtSignal()
     activeModeChanged = pyqtSignal()
@@ -66,7 +63,6 @@ class WorkspaceDialog(QObject):
     numUserSettingsChanged = pyqtSignal()
     machineTypeChanged = pyqtSignal()
     variantTypeChanged = pyqtSignal()
-    extrudersChanged = pyqtSignal()
 
     @pyqtProperty(str, notify=variantTypeChanged)
     def variantType(self):
@@ -111,15 +107,6 @@ class WorkspaceDialog(QObject):
         if self._material_labels != material_labels:
             self._material_labels = material_labels
             self.materialLabelsChanged.emit()
-
-    @pyqtProperty("QVariantList", notify=extrudersChanged)
-    def extruders(self):
-        return self._extruders
-
-    def setExtruders(self, extruders):
-        if self._extruders != extruders:
-            self._extruders = extruders
-            self.extrudersChanged.emit()
 
     @pyqtProperty(str, notify = machineNameChanged)
     def machineName(self):
@@ -196,10 +183,6 @@ class WorkspaceDialog(QObject):
     def qualityChangesConflict(self):
         return self._has_quality_changes_conflict
 
-    @pyqtProperty(bool, notify=definitionChangesConflictChanged)
-    def definitionChangesConflict(self):
-        return self._has_definition_changes_conflict
-
     @pyqtProperty(bool, notify=materialConflictChanged)
     def materialConflict(self):
         return self._has_material_conflict
@@ -228,11 +211,6 @@ class WorkspaceDialog(QObject):
         if self._has_quality_changes_conflict != quality_changes_conflict:
             self._has_quality_changes_conflict = quality_changes_conflict
             self.qualityChangesConflictChanged.emit()
-
-    def setDefinitionChangesConflict(self, definition_changes_conflict):
-        if self._has_definition_changes_conflict != definition_changes_conflict:
-            self._has_definition_changes_conflict = definition_changes_conflict
-            self.definitionChangesConflictChanged.emit()
 
     def getResult(self):
         if "machine" in self._result and not self._has_machine_conflict:

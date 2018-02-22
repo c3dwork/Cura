@@ -1,5 +1,16 @@
-# Copyright (c) 2017 Ultimaker B.V.
+# Copyright (c) 2018 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
+
+from collections import defaultdict
+from configparser import ConfigParser
+import zipfile
+import io
+import configparser
+import os
+import threading
+import urllib.parse
+
+import xml.etree.ElementTree as ET
 
 from UM.Workspace.WorkspaceReader import WorkspaceReader
 from UM.Application import Application
@@ -14,9 +25,8 @@ from UM.MimeTypeDatabase import MimeTypeDatabase
 from UM.Job import Job
 from UM.Preferences import Preferences
 from UM.Util import parseBool
-from .WorkspaceDialog import WorkspaceDialog
 
-import xml.etree.ElementTree as ET
+from .WorkspaceDialog import WorkspaceDialog
 
 from cura.Settings.CuraStackBuilder import CuraStackBuilder
 from cura.Settings.ExtruderManager import ExtruderManager
@@ -24,13 +34,6 @@ from cura.Settings.ExtruderStack import ExtruderStack
 from cura.Settings.GlobalStack import GlobalStack
 from cura.Settings.CuraContainerStack import _ContainerIndexes
 from cura.CuraApplication import CuraApplication
-
-from configparser import ConfigParser
-import zipfile
-import io
-import configparser
-import os
-import threading
 
 i18n_catalog = i18nCatalog("cura")
 
@@ -143,6 +146,233 @@ class ThreeMFWorkspaceReader(WorkspaceReader):
 
         return global_stack_file_list[0], extruder_stack_file_list
 
+    def _loadFile(self, archive, file_name, class_type):
+        serialized = archive.open(file_name).read().decode("utf-8")
+        file_name = os.path.basename(file_name)
+        # Upgrade the serialized data
+        serialized = class_type._updateSerialized(serialized, file_name)
+
+        parser = ConfigParser(interpolation = None)
+        parser.read_string(serialized)
+
+        # qualities and variants are not upgraded
+        if parser["metadata"]["type"] not in ("quality", "variant"):
+            # Check if upgrade was successful
+            if not parser.has_option("general", "version"):
+                raise RuntimeError("%s failed to be upgraded: missing 'general/version'" % file_name)
+            container_version = parser.getint("general", "version")
+            if container_version != class_type.Version:
+                raise RuntimeError("%s failed to be upgraded: version '%s' is not the latest '%s'" %
+                                   (file_name, container_version, class_type.Version))
+            if not parser.has_option("metadata", "setting_version"):
+                raise RuntimeError("%s failed to be upgraded: missing 'metadata/setting_version'" % file_name)
+            container_setting_version = parser.getint("metadata", "setting_version")
+            if container_setting_version != CuraApplication.SettingVersion:
+                raise RuntimeError("%s failed to be upgraded: version '%s' is not the latest '%s'" %
+                                   (file_name, container_setting_version, CuraApplication.SettingVersion))
+
+        container_type = parser["metadata"]["type"]
+        if container_type not in ("machine", "extruder_train", "definition_changes", "variant", "quality",
+                                  "quality_changes", "user"):
+            raise RuntimeError("%s has unknown type '%s'" % (file_name, container_type))
+
+        mime_type = MimeTypeDatabase.getMimeTypeForFile(file_name)
+        container_id = urllib.parse.unquote_plus(mime_type.stripExtension(os.path.basename(file_name)))
+
+        return {"id": container_id,
+                "file_name": file_name,
+                "container_type": parser["metadata"]["type"],
+                "parser": parser}
+
+    def _loadFilesAndValidate(self, archive) -> dict:
+        file_list = [name for name in archive.namelist() if name.startswith("Cura/")]
+
+        global_stack_file_list = [name for name in file_list if name.endswith(self._global_stack_suffix)]
+        extruder_stack_file_list = [name for name in file_list if name.endswith(self._extruder_stack_suffix)]
+        xml_material_profile = self._getXmlProfileClass()
+        if self._material_container_suffix is None:
+            self._material_container_suffix = ContainerRegistry.getMimeTypeForContainer(xml_material_profile).preferredSuffix
+        material_file_list = [name for name in file_list if name.endswith(self._material_container_suffix)]
+        container_file_list = [name for name in file_list if name.endswith(self._instance_container_suffix)]
+
+        stack_files_to_determine = [name for name in file_list if name.endswith(self._container_stack_suffix)]
+
+        # separate container stack files and extruder stack files
+        for file_name in stack_files_to_determine:
+            # FIXME: HACK!
+            # We need to know the type of the stack file, but we can only know it if we deserialize it.
+            # The default ContainerStack.deserialize() will connect signals, which is not desired in this case.
+            # Since we know that the stack files are INI files, so we directly use the ConfigParser to parse them.
+            serialized = archive.open(file_name).read().decode("utf-8")
+            stack_config = ConfigParser(interpolation = None)
+            stack_config.read_string(serialized)
+
+            # sanity check
+            if not stack_config.has_option("metadata", "type"):
+                raise RuntimeError("%s in %s doesn't seem to be a valid stack file" % file_name)
+
+            stack_type = stack_config["metadata"]["type"]
+            if stack_type == "extruder_train":
+                extruder_stack_file_list.append(file_name)
+            elif stack_type == "machine":
+                global_stack_file_list.append(file_name)
+            else:
+                raise RuntimeError("Unknown container stack type '%s' from %s" % (stack_type, file_name))
+
+        if len(global_stack_file_list) != 1:
+            raise RuntimeError("Found %s global_stack files but only one is expected." % len(global_stack_file_list))
+
+        containers_to_load_dict = {GlobalStack: global_stack_file_list,
+                                   ExtruderStack: extruder_stack_file_list,
+                                   InstanceContainer: container_file_list}
+
+        container_files_dict = defaultdict(dict)
+        container_files_dict["material"] = material_file_list
+        for class_type, file_list in containers_to_load_dict.items():
+            for file_name in file_list:
+                container_info = self._loadFile(archive, file_name, class_type)
+                container_type = container_info["container_type"]
+                container_id = container_info["id"]
+                container_files_dict[container_type][container_id] = container_info
+
+        return container_files_dict
+
+    def _preRead(self, file_name, show_dialog = True, *args, **kwargs):
+        self._3mf_mesh_reader = Application.getInstance().getMeshFileHandler().getReaderForFile(file_name)
+        if not (self._3mf_mesh_reader and self._3mf_mesh_reader.preRead(file_name) == WorkspaceReader.PreReadResult.accepted):
+            Logger.log("e", "Could not find reader that was able to read the scene data for 3MF workspace")
+            return WorkspaceReader.PreReadResult.failed
+
+        machine_definition_id = ""
+
+        # Check if there are any conflicts, so we can ask the user.
+        archive = zipfile.ZipFile(file_name, "r")
+
+        try:
+            file_dict = self._loadFilesAndValidate(archive)
+        except:
+            Logger.logException("e", "Failed to load files from project file %s", file_name)
+            return WorkspaceReader.PreReadResult.failed
+
+        info_dict = self._getSummaryInfo(archive, file_dict)
+        print("!!!")
+
+    def _getSummaryInfo(self, archive, file_dict):
+        container_registry = ContainerRegistry.getInstance()
+
+        machine_info = list(file_dict["machine"].values())[0]
+
+        machine_name = machine_info["parser"]["general"]["name"]
+        machine_definition_id = machine_info["parser"]["containers"]["6"]
+        machine_definition_metadata_list = container_registry.findDefinitionContainersMetadata(id = machine_definition_id)
+        if not machine_definition_metadata_list:
+            raise RuntimeError("Cannot get definition with ID %s" % machine_definition_id)
+        machine_definition_metadata = machine_definition_metadata_list[0]
+        machine_type_name = machine_definition_metadata["name"]
+
+        machine_metadata_list = container_registry.findContainerStacksMetadata(name = machine_name)
+        machine_name_exists = len(machine_metadata_list) > 0
+        machine_metadata = machine_metadata_list[0]
+
+        global_quality_container_id = machine_info["parser"]["containers"]["2"]
+        global_quality_type = file_dict["quality"][global_quality_container_id]["parser"]["metadata"]["quality_type"]
+        global_quality_changes_container_id = machine_info["parser"]["containers"]["1"]
+
+        has_custom_quality = global_quality_changes_container_id not in ("empty", "empty_quality_changes")
+        if has_custom_quality:
+            parser = file_dict["quality_changes"][global_quality_changes_container_id]["parser"]
+        else:
+            parser = file_dict["quality"][global_quality_container_id]["parser"]
+        quality_name = parser["general"]["name"]
+
+        # Get the number of settings overriden by quality_changes
+        quality_changes_values_count = 0
+        for info in file_dict["quality_changes"].values():
+            quality_changes_values_count += len(info["parser"]["values"])
+        user_values_count = 0
+        for info in file_dict["user"].values():
+            user_values_count += len(info["parser"]["values"])
+
+        has_user_values = user_values_count > 0
+
+        material_labels = []
+        for file_name in file_dict["material"]:
+            material_labels.append(self._getMaterialLabelFromSerialized(archive.open(file_name).read().decode("utf-8")))
+
+        machine_summary_dict = {"variant": machine_info["parser"]["containers"]["2"],
+                                "material": machine_info["parser"]["containers"]["3"]}
+        extruder_info_dict = {}
+        extruders_summary_dict = {}
+        if not file_dict["extruders"]:
+            # one extruder
+            extruders_summary_dict["0"] = machine_summary_dict
+            machine_summary_dict = {"variant": "empty_variant",
+                                    "material": "empty_material"}
+        else:
+            for info_dict in file_dict["extruders"].values():
+                parser = info_dict["parser"]
+                position = parser["metadata"]["position"]
+                if position in extruders_summary_dict:
+                    raise RuntimeError("Found mulitple extruders at the same position %s" % position)
+                extruder_info_dict[position] = info_dict
+
+        # Check machine conflicts
+        has_machine_conflicts = False
+        has_quality_conflicts = False
+        has_material_conflicts = False
+        must_create_new = False
+        if machine_name_exists:
+            machine_stack = container_registry.findContainerStacks(id = machine_metadata["id"])[0]
+            for idx in range(7):
+                if machine_stack.getContainer(idx).getId() != machine_info["parser"]["containers"][str(idx)]:
+                    has_machine_conflicts = True
+                    if idx == _ContainerIndexes.Material:
+                        has_material_conflicts = True
+                    if idx == _ContainerIndexes.QualityChanges:
+                        has_quality_conflicts = True
+                    if idx == _ContainerIndexes.Definition:
+                        must_create_new = True
+                    break
+            # Continue to check if there is no conflicts so far
+            if not (has_machine_conflicts or has_material_conflicts or has_quality_conflicts or must_create_new):
+                extruder_stacks = container_registry.findContainerStacks(machine = machine_metadata["name"])
+                if len(extruder_stacks) != len(extruders_summary_dict):
+                    has_machine_conflicts = True
+                else:
+                    for extruder_stack in extruder_stacks:
+                        for idx in range(7):
+                            if extruder_stack.getContainer(idx).getId() != machine_info["parser"]["containers"][str(idx)]:
+                                has_machine_conflicts = True
+                                if idx == _ContainerIndexes.Material:
+                                    has_material_conflicts = True
+                                elif idx == _ContainerIndexes.QualityChanges:
+                                    has_quality_conflicts = True
+                                else:
+                                    if idx == _ContainerIndexes.Definition:
+                                        must_create_new = True
+                                break
+                        if has_machine_conflicts:
+                            break
+
+        summary_info = {"machine_name": machine_name,
+                        "machine_type": machine_type_name,
+                        "quality_name": quality_name,
+                        "quality_type": global_quality_type,
+                        "quality_changes_settings_count": quality_changes_values_count,
+                        "user_settings_count": user_values_count,
+                        "material_labels": material_labels,
+
+                        "has_machine_conflicts": has_machine_conflicts,
+                        "has_quality_conflicts": has_quality_conflicts,
+                        "has_material_conflicts": has_material_conflicts,
+                        "must_create_new": must_create_new,
+                        }
+        return summary_info
+
+    def _checkMachineConflicts(self, archive, file_dict):
+        #TODO
+        pass
+
     ##  read some info so we can make decisions
     #   \param file_name
     #   \param show_dialog  In case we use preRead() to check if a file is a valid project file, we don't want to show a dialog.
@@ -153,6 +383,8 @@ class ThreeMFWorkspaceReader(WorkspaceReader):
         else:
             Logger.log("w", "Could not find reader that was able to read the scene data for 3MF workspace")
             return WorkspaceReader.PreReadResult.failed
+
+        self._preRead(file_name, show_dialog, *args, **kwargs)
 
         machine_type = ""
         variant_type_name = i18n_catalog.i18nc("@label", "Nozzle")
@@ -169,40 +401,6 @@ class ThreeMFWorkspaceReader(WorkspaceReader):
         resolve_strategy_keys = ["machine", "material", "quality_changes"]
         self._resolve_strategies = {k: None for k in resolve_strategy_keys}
         containers_found_dict = {k: False for k in resolve_strategy_keys}
-
-        #
-        # Read definition containers
-        #
-        machine_definition_container_count = 0
-        extruder_definition_container_count = 0
-        definition_container_files = [name for name in cura_file_names if name.endswith(self._definition_container_suffix)]
-        for each_definition_container_file in definition_container_files:
-            container_id = self._stripFileToId(each_definition_container_file)
-            definitions = self._container_registry.findDefinitionContainersMetadata(id = container_id)
-
-            if not definitions:
-                definition_container = DefinitionContainer(container_id)
-                definition_container.deserialize(archive.open(each_definition_container_file).read().decode("utf-8"), file_name = each_definition_container_file)
-                definition_container = definition_container.getMetaData()
-
-            else:
-                definition_container = definitions[0]
-
-            definition_container_type = definition_container.get("type")
-            if definition_container_type == "machine":
-                machine_type = definition_container["name"]
-                variant_type_name = definition_container.get("variants_name", variant_type_name)
-
-                machine_definition_container_count += 1
-            elif definition_container_type == "extruder":
-                extruder_definition_container_count += 1
-            else:
-                Logger.log("w", "Unknown definition container type %s for %s",
-                           definition_container_type, each_definition_container_file)
-            Job.yieldThread()
-
-        if machine_definition_container_count != 1:
-            return WorkspaceReader.PreReadResult.failed #Not a workspace file but ordinary 3MF.
 
         material_labels = []
         material_conflict = False
@@ -363,7 +561,6 @@ class ThreeMFWorkspaceReader(WorkspaceReader):
         # Show the dialog, informing the user what is about to happen.
         self._dialog.setMachineConflict(machine_conflict)
         self._dialog.setQualityChangesConflict(quality_changes_conflict)
-        self._dialog.setDefinitionChangesConflict(definition_changes_conflict)
         self._dialog.setMaterialConflict(material_conflict)
         self._dialog.setHasVisibleSettingsField(has_visible_settings_string)
         self._dialog.setNumVisibleSettings(num_visible_settings)
@@ -375,8 +572,7 @@ class ThreeMFWorkspaceReader(WorkspaceReader):
         self._dialog.setMachineName(machine_name)
         self._dialog.setMaterialLabels(material_labels)
         self._dialog.setMachineType(machine_type)
-        self._dialog.setExtruders(extruders)
-        self._dialog.setVariantType(variant_type_name)
+        self._dialog.setVariantType(i18n_catalog.i18nc("@label", "Nozzle"))
         self._dialog.setHasObjectsOnPlate(Application.getInstance().platformActivity)
         self._dialog.show()
 
